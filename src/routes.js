@@ -15,6 +15,10 @@ const {
   evaluateExport, mapRow,
 } = require('./translation');
 const { parseDeliveryBody, evaluateDelivery, listBatches, loadBatch } = require('./delivery');
+const {
+  parseBatchBody, contentHash, canonicalRequest, evaluateBatch,
+  findBatch, listBatches: listTranslationBatches,
+} = require('./translation-batch');
 const { toWebVtt } = require('./vtt');
 
 /**
@@ -1147,6 +1151,253 @@ function createApp(db) {
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="project-${p.id}-${lang}-v${row.version}.vtt"`);
     res.send(row.content);
+  });
+
+  // ---------- 译者整批译文回填（按一种目标语言整批写回当前字幕） ----------
+  //
+  // 译者完成整批译文后一次提交：批次编号 + 语言代号 + 读取时字幕集/规则版本 +
+  // 非空逐行清单（字幕 ID、源行版本、译文版本、非空文本）。按字幕 ID 对齐，
+  // 允许覆盖待复核译文；同批重复 ID、无效语言、不存在的字幕 → 400。
+  // 提交时在同一事务内重新核对字幕集/规则版本、逐行源行版本与译文版本、
+  // 当前字数/字速规则：任一行过期（409）或违规（422）按行返回当前值与原因，
+  // 整批不写入。全部通过则同事务保存全部译文：新增版本从 1 开始，
+  // 更新版本递增并刷新源快照为 current；未列出的行与其他语言不变。
+  // 幂等：同项目同语言批次编号重复且内容相同 → 返回首次结果（200，不再次写入）；
+  // 编号相同内容不同 → 409 冲突；失败批次不占编号。
+
+  /**
+   * 提交整批译文回填。
+   *   {batch_no, sub_version, rules_version, lang?,
+   *    items: [{subtitle_id, cue_version, version?, text}]}
+   * 201 整批写入成功；200 幂等重放（同号同内容，返回首次结果）；
+   * 400 请求非法（形状/重复 ID/不存在的字幕/语言代号不一致）；
+   * 409 批次编号冲突（同号不同内容）或版本过期（字幕集/规则/源行/译文，按行带当前值）；
+   * 422 逐行违反当前字数/字速规则（按行带原因）。
+   */
+  app.post('/api/projects/:id/translations/:lang/batches', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    const body = req.body || {};
+    // 语言代号以路径为准；请求体若重复给出必须一致（译者提交内容自校验）
+    if (body.lang !== undefined && body.lang !== lang) {
+      return res.status(400).json({
+        error: `请求体语言代号 ${JSON.stringify(body.lang)} 与路径语言 ${lang} 不一致，未写入`,
+        errors: [`lang 须与路径一致（${lang}）或省略`],
+      });
+    }
+
+    // 1. 形状校验：批次编号/版本形状/空清单/重复 ID/空文本/非法字段 → 400
+    const parsed = parseBatchBody(body);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: '回填请求非法，整批未写入', errors: parsed.errors });
+    }
+    const request = parsed.request;
+
+    // 2. 幂等（只读）：同项目同语言同批次编号——内容相同重放首次结果，不同则冲突。
+    //    必须先于任何基于当前状态的校验：成功批次重试时项目可能已变化，仍须返回首次结果。
+    const hash = contentHash(lang, request);
+    const prior = findBatch(db, p.id, lang, request.batch_no);
+    if (prior) {
+      if (prior.content_hash === hash) {
+        return res.status(200).json({ ...JSON.parse(prior.result_json), replayed: true });
+      }
+      return res.status(409).json({
+        error: `批次编号 ${request.batch_no} 在语言 ${lang} 下已使用且内容不同，整批未写入`,
+        conflict: true,
+        batch_no: request.batch_no,
+        lang,
+        existing: {
+          item_count: prior.item_count,
+          sub_version: prior.sub_version,
+          rules_version: prior.rules_version,
+          created_at: prior.created_at,
+        },
+      });
+    }
+
+    // 3. 不存在的字幕 → 400（与同批重复 ID、无效语言同属请求级拒绝）
+    const cueIds = new Set(p.subtitles.map((c) => c.id));
+    const unknown = request.items.filter((it) => !cueIds.has(it.subtitle_id)).map((it) => it.subtitle_id);
+    if (unknown.length > 0) {
+      return res.status(400).json({
+        error: '回填请求非法，整批未写入',
+        errors: [`字幕 ${unknown.join(', ')} 在当前字幕集中不存在（可能已被重排删除），请刷新后按当前行重新提交`],
+      });
+    }
+
+    class BatchReject extends Error {
+      constructor(statusCode, payload) {
+        super(payload.error || '回填被拒绝');
+        this.statusCode = statusCode;
+        this.payload = payload;
+      }
+    }
+
+    const tx = db.transaction(() => {
+      // 4. 事务内读取权威当前状态并重新核对：字幕集/规则版本、逐行源行与译文版本、当前规则
+      const fresh = loadProject(db, p.id);
+      const existingByCue = activeTranslationsByLang(db, fresh.id, lang);
+      const evaluation = evaluateBatch(fresh, request, existingByCue);
+
+      if (evaluation.sub_version_stale || evaluation.rules_version_stale) {
+        const why = [];
+        if (evaluation.sub_version_stale) {
+          why.push(`字幕集版本漂移：提交基于 v${request.sub_version}，当前已是 v${fresh.sub_version}`);
+        }
+        if (evaluation.rules_version_stale) {
+          why.push(`规则版本漂移：提交基于 v${request.rules_version}，当前已是 v${fresh.rules.version}`);
+        }
+        throw new BatchReject(409, {
+          error: `${why.join('；')}；整批未写入，请刷新后重新提交`,
+          sub_version_stale: evaluation.sub_version_stale,
+          rules_version_stale: evaluation.rules_version_stale,
+          current: {
+            sub_version: fresh.sub_version,
+            rules_version: fresh.rules.version,
+            rules: fresh.rules,
+            subtitles: fresh.subtitles,
+          },
+        });
+      }
+
+      const staleItems = evaluation.items.filter((i) => i.state === 'stale');
+      if (staleItems.length > 0) {
+        throw new BatchReject(409, {
+          error: `批次 ${request.batch_no} 有 ${staleItems.length} 行版本过期，整批未写入，请按当前值刷新后重新提交`,
+          sub_version: fresh.sub_version,
+          rules_version: fresh.rules.version,
+          items: staleItems,
+        });
+      }
+      const invalidItems = evaluation.items.filter((i) => i.state === 'invalid');
+      if (invalidItems.length > 0) {
+        throw new BatchReject(422, {
+          error: `批次 ${request.batch_no} 有 ${invalidItems.length} 行未通过当前字数/字速规则（规则 v${fresh.rules.version}），整批未写入`,
+          sub_version: fresh.sub_version,
+          rules_version: fresh.rules.version,
+          items: invalidItems,
+        });
+      }
+
+      // 5. 全部通过：同一事务保存全部译文。新增版本从 1 开始；
+      //    更新版本递增并刷新源快照为 current（允许覆盖待复核译文）。
+      const cueById = new Map(fresh.subtitles.map((c) => [c.id, c]));
+      const upd = db.prepare(
+        `UPDATE translations SET text = ?, version = version + 1, status = 'current',
+           cue_version_snapshot = ?, src_text = ?, src_start_ms = ?, src_end_ms = ?,
+           src_word_start = ?, src_word_end = ?, updated_at = datetime('now')
+         WHERE id = ? AND version = ?`
+      );
+      const ins = db.prepare(
+        `INSERT INTO translations
+           (project_id, lang, subtitle_id, text, status, version, cue_version_snapshot,
+            src_text, src_start_ms, src_end_ms, src_word_start, src_word_end)
+         VALUES (?, ?, ?, ?, 'current', 1, ?, ?, ?, ?, ?, ?)`
+      );
+      const readBack = db.prepare('SELECT * FROM translations WHERE id = ?');
+
+      const results = [];
+      let createdCount = 0;
+      let updatedCount = 0;
+      for (const it of request.items) {
+        const cue = cueById.get(it.subtitle_id);
+        const existing = existingByCue.get(it.subtitle_id) || null;
+        let rowId;
+        let action;
+        if (existing) {
+          const info = upd.run(
+            it.text, cue.version, cue.text, cue.start_ms, cue.end_ms,
+            cue.word_start, cue.word_end, existing.id, it.version
+          );
+          if (info.changes !== 1) {
+            throw new BatchReject(409, {
+              error: `字幕 ${it.subtitle_id} 的译文在写入瞬间发生变化，整批未写入，请刷新后重试`,
+              current: { sub_version: fresh.sub_version },
+            });
+          }
+          rowId = existing.id;
+          action = 'updated';
+          updatedCount++;
+        } else {
+          rowId = ins.run(
+            fresh.id, lang, it.subtitle_id, it.text, cue.version, cue.text,
+            cue.start_ms, cue.end_ms, cue.word_start, cue.word_end
+          ).lastInsertRowid;
+          action = 'created';
+          createdCount++;
+        }
+        const row = readBack.get(rowId);
+        results.push({
+          subtitle_id: it.subtitle_id,
+          action,
+          version: row.version,
+          translation: mapRow(row),
+        });
+      }
+
+      // 6. 记录成功批次（同事务）：只有核对通过并写入的批次才占用编号
+      const resultBody = {
+        batch_no: request.batch_no,
+        lang,
+        sub_version: fresh.sub_version,
+        rules_version: fresh.rules.version,
+        item_count: request.items.length,
+        created_count: createdCount,
+        updated_count: updatedCount,
+        items: results,
+      };
+      db.prepare(
+        `INSERT INTO translation_batches
+           (project_id, lang, batch_no, content_hash, request_json, result_json,
+            sub_version, rules_version, item_count, created_count, updated_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        fresh.id, lang, request.batch_no, hash,
+        JSON.stringify(canonicalRequest(lang, request)),
+        JSON.stringify(resultBody),
+        fresh.sub_version, fresh.rules.version,
+        request.items.length, createdCount, updatedCount
+      );
+      return resultBody;
+    });
+
+    try {
+      const done = tx();
+      res.status(201).json(done);
+    } catch (err) {
+      if (err instanceof BatchReject) {
+        return res.status(err.statusCode).json(err.payload);
+      }
+      throw err;
+    }
+  });
+
+  /** 某语言回填批次列表（倒序；不含逐行明细） */
+  app.get('/api/projects/:id/translations/:lang/batches', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    res.json({
+      project_id: p.id,
+      lang,
+      batches: listTranslationBatches(db, p.id, lang),
+    });
+  });
+
+  /** 单个回填批次（首次结果原样返回，含逐行写入明细） */
+  app.get('/api/projects/:id/translations/:lang/batches/:batchNo', (req, res) => {
+    const p = getProject(req, res);
+    if (!p) return;
+    const lang = getLang(req, res);
+    if (!lang) return;
+    const batch = findBatch(db, p.id, lang, req.params.batchNo);
+    if (!batch) {
+      return res.status(404).json({ error: `语言 ${lang} 的批次 ${req.params.batchNo} 不存在（失败批次不占编号）` });
+    }
+    res.json({ ...JSON.parse(batch.result_json), created_at: batch.created_at });
   });
 
   // ---------- 片方多语字幕交付（原文 + 多语言冻结为同一时间轴的一个批次） ----------

@@ -148,6 +148,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_translations_one_per_cue
 CREATE INDEX IF NOT EXISTS idx_translations_project_lang
   ON translations(project_id, lang, status);
 
+-- 译者整批译文回填：一次提交把一种目标语言的整批译文按字幕 ID 对齐写入。
+-- 仅核对通过的批次才落记录（失败批次不占编号）；同项目同语言批次编号唯一。
+-- content_hash 为规范化请求（语言 + 字幕集/规则版本 + 按字幕 ID 排序的逐行内容）的 SHA-256：
+--   同号同内容 → 幂等重放首次结果，不再次写入；同号不同内容 → 409 冲突。
+CREATE TABLE IF NOT EXISTS translation_batches (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  lang          TEXT NOT NULL,                -- 目标语言代号
+  batch_no      TEXT NOT NULL,                -- 译者提交的批次编号（规范化后的字符串）
+  content_hash  TEXT NOT NULL,                -- 规范化内容哈希（幂等比对）
+  request_json  TEXT NOT NULL,                -- 规范化请求快照（审计留档）
+  result_json   TEXT NOT NULL,                -- 首次成功结果（幂等重放时原样返回）
+  sub_version   INTEGER NOT NULL,             -- 提交时核对通过的字幕集版本
+  rules_version INTEGER NOT NULL,             -- 提交时核对通过的规则版本
+  item_count    INTEGER NOT NULL,             -- 本批行数
+  created_count INTEGER NOT NULL,             -- 其中新建译文数（版本从 1 开始）
+  updated_count INTEGER NOT NULL,             -- 其中更新译文数（版本递增）
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang, batch_no)
+);
+
 -- 按语言导出的不可变 WebVTT 快照（与原文导出 exports 互不影响）
 CREATE TABLE IF NOT EXISTS translation_exports (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
