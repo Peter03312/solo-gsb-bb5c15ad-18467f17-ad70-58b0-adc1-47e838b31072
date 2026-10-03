@@ -16,6 +16,7 @@
 - **导出**：确认后生成按时间升序的 WebVTT，存为**不可变版本快照**，可随时再次下载；后续修改不影响旧文件。导出前会完整校验（含锁定字幕），违规则拒绝并列出问题。
 - **多语言译文字幕**：按原时间轴维护多语言译文。校对者以**非空目标语言代号、字幕 ID、读取时行版本 `cue_version` 与译文版本 `version`**（新建传 0/省略）保存译文；查询逐行并列原文、译文与状态（`current`/`review`/`missing`）。同一语言每条当前字幕最多一份译文。译文**沿用源字幕起止与词区间**，接口不接受任何时间/切点/原文字段，且须满足当前**最大字数与字速**规则（时长随源行）。源字幕**文本/时间/词区间**变化 → 译文自动转**待复核**；仅锁定或展示顺序变化不使译文失效；重排删除的原行译文**留作历史**，新行视为缺译，**不按序号自动挪用**。校对者可在当前源行上确认待复核译文，过期版本或无效译文返回当前值与原因且不改数据。按语言导出前须确认当前每行均有有效译文且整版符合时间与切点约束，否则分类列出缺漏/待复核/无效/冲突且**不生成快照**；成功导出的译文 WebVTT 快照**不可变**，与原文导出相互独立。
 - **片方多语字幕交付（批次冻结）**：一次提交把**原文与选定的多种语言冻结为同一时间轴的一个批次**。请求携带当前字幕集版本 `sub_version`、规则版本 `rules_version`、**非空且不重复**的目标语言列表，以及各语言**逐行译文版本**清单。服务端在**同一个事务内**核对：提交版本仍有效（字幕集/规则漂移 → `409`）、源字幕整版结构（词覆盖/不重叠/不跨切点/不缩短词时段）与现行规则通过、每种语言每行译文均为 `current` 且满足字数/字速、译文版本与提交一致；任一语言**缺译/待复核/无效/版本漂移**都按语言和字幕行返回原因，**整批不生成快照、不消耗版本**。成功时在现有**原文导出序列与各语言导出序列**中各生成一个不可变 WebVTT 版本（因此文件直接经现有下载接口取得），并以**批次清单**关联文件、字幕集版本与规则版本；各文件时间轴完全一致，后续编辑不改变旧批次。既有原文导出、单语言导出及下载约定保持兼容。
+- **译者整批译文回填（本轮新增）**：译者完成整批译文后，可按**一种目标语言**把整批译文回填到当前字幕。提交**批次编号** `batch_no`、读取时字幕集版本 `sub_version`、规则版本 `rules_version` 与**非空逐行清单**（字幕 ID、源行版本 `cue_version`、译文版本 `version`（新建 `0`/省略）、非空文本）。按字幕 ID 对齐，允许覆盖**待复核**译文；**同批重复 ID、无效语言、不存在的字幕**一律拒绝。提交时在事务内重新核对版本、源行及当前**字数/字速**规则：任一行过期（字幕集/规则/源行/译文版本）或违规，**按行返回当前值与原因，整批不写入**。通过后在**同一事务**保存全部译文——新建版本从 `1` 开始，更新版本递增并把源快照刷新为 `current`；**未列出的行与其他语言不变**，且回填只写译文、不推进 `sub_version`。**同项目同语言批次编号重复且内容相同**（内容指纹对清单按字幕 ID 排序，提交顺序不影响判定）→ 返回首次结果（`200 replayed`）而不再次写入；**编号相同但内容不同** → `409` 冲突；**失败批次不占编号**。回填结果就是普通译文，逐行译文操作、单语言导出与多语交付继续读取，**旧导出快照保持不变**。
 
 ## 启动
 
@@ -64,7 +65,8 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 6. **批量修订提议（校对者流程）**：在左侧 ⑤ 面板按 JSON 提交一组字幕修订（或"填入所有行"后删改；只针对未锁定字幕），提交后自动打开预览，逐项并列**原值 / 当前值 / 建议值**并标注每处冲突；全部通过时点"整组采纳"（原子写入，失败整组不生效）。也可用 `examples/revisions-api.sh` 走纯 HTTP 流程。
 7. **导出**：点"确认当前字幕并导出 WebVTT"，生成 v1、v2…… 任意版本可随时重新下载。词修正确认与字幕修订采纳均不影响已生成的旧快照。
 8. **多语言译文（本轮新增）**：在左侧 ⑦ 面板填入语言代号（如 `en`）并"载入语言"，逐行对照原文保存译文；源行变更后状态变"待复核"，可"✓ 确认仍适用"或重新保存；全部有效后点"校验并导出该语言 WebVTT"，缺漏/冲突会分类列出且不生成快照。HTTP 流程见 `examples/translations-api.sh`。
-9. **片方交付批次（本轮新增）**：各语言译文都 current 且有效后，按 `POST /api/projects/:id/deliveries` 提交 `{sub_version, rules_version, languages, translations:{lang:[{subtitle_id, version}]}}`，服务端事务内整版核对，通过即把原文与各语言冻结为同一时间轴的一个批次（各序列生成不可变 WebVTT，文件走既有下载接口）；失败按语言和字幕行返回原因且不生成快照、不耗版本。清单用 `GET /api/projects/:id/deliveries` 查询。HTTP 流程见 `examples/deliveries-api.sh`。
+9. **片方交付批次**：各语言译文都 current 且有效后，按 `POST /api/projects/:id/deliveries` 提交 `{sub_version, rules_version, languages, translations:{lang:[{subtitle_id, version}]}}`，服务端事务内整版核对，通过即把原文与各语言冻结为同一时间轴的一个批次（各序列生成不可变 WebVTT，文件走既有下载接口）；失败按语言和字幕行返回原因且不生成快照、不耗版本。清单用 `GET /api/projects/:id/deliveries` 查询。HTTP 流程见 `examples/deliveries-api.sh`。
+10. **译者整批译文回填（本轮新增）**：整批译文完成后，按 `POST /api/projects/:id/translations/:lang/batches` 一次提交一种语言，携带 `batch_no`、`sub_version`、`rules_version` 与逐行 `items:[{subtitle_id, cue_version, version, text}]`（新建 `version=0`）；同批重复 ID/无效语言/不存在字幕 → `400`，版本过期 → `409`，超字数/字速 → `422`，均按行返回当前值与原因且整批不写入；成功后新建从 v1、更新版本 +1（可覆盖待复核）。同编号同内容重放返回首次结果（`200 replayed`），同编号不同内容 `409` 冲突，失败不占编号。回填结果直接被并列查询、单语言导出与多语交付读取。HTTP 流程见 `examples/translation-batches-api.sh`。
 
 ## API 摘要
 
@@ -97,6 +99,10 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 | `POST` | `/api/projects/:id/translations/:lang/exports` | 校验并按语言导出译文 WebVTT；缺译/待复核/无效/整版冲突 → `422` 分类列出不生成快照（可带 `sub_version` 防呆，过期 → `409`） |
 | `GET` | `/api/projects/:id/translations/:lang/exports` | 某语言译文导出快照列表 |
 | `GET` | `/api/projects/:id/translations/:lang/exports/:version` | 下载某语言某版本译文 `.vtt`（内容创建后不变） |
+| `POST` | `/api/projects/:id/translations/:lang/batches` | **译者整批回填（一种语言）**：`{batch_no, sub_version, rules_version, items:[{subtitle_id, cue_version, version?(0=新建), text}]}`；首次 `201`，同编号同内容重放 `200 replayed`；形状非法 `400`、版本过期/编号冲突 `409`、字数/字速违规 `422`（按行返回 `current` 与原因，整批不写入，失败不占编号） |
+| `GET` | `/api/projects/:id/translations/:lang/batches/list` | 某语言译文回填批次清单（倒序） |
+| `GET` | `/api/projects/:id/translation-batches` | 全部语言译文回填批次清单（倒序） |
+| `GET` | `/api/projects/:id/translation-batches/:tbid` | 单个回填批次：逐行清单与写入结果（`created`/`updated`、结果版本） |
 | `POST` | `/api/projects/:id/deliveries` | **片方交付批次**：`{note?, sub_version, rules_version, languages:[...], translations:{lang:[{subtitle_id, version}]}}`；事务内核对版本/结构/规则/逐行译文，通过则原文与各语言各生成一个不可变 WebVTT 并关联批次 |
 | `GET` | `/api/projects/:id/deliveries` | 交付批次清单（倒序，含每批文件清单、字幕集/规则版本） |
 | `GET` | `/api/projects/:id/deliveries/:bid` | 单个批次清单（文件序列版本与既有下载地址；正文走下载接口） |
@@ -212,6 +218,59 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 
 纯 HTTP 完整示例：`examples/translations-api.sh`（新建项目→保存→乐观锁与非法示例→并列查询→锁定/源变更失效→确认→重排历史与缺译→导出拒绝→双语言导出与快照下载）。浏览器内使用左侧 ⑦ 面板：填语言代号「载入语言」后逐行保存/确认，右上按钮校验并导出。
 
+## 译者整批译文回填（一种目标语言整批写入当前字幕）
+
+译者完成整批译文后，可以按**一种目标语言**把整批译文一次回填到当前字幕，而不必逐行 `PUT`。回填是组级、乐观锁、**原子**写入，结果就是普通译文——既有逐行操作、并列查询、单语言导出与多语交付全部照常读取。
+
+- 提交内容：**批次编号** `batch_no`（非空、≤64 字；同项目同语言唯一）、读取时的**字幕集版本** `sub_version` 与**规则版本** `rules_version`、可选 `note`，以及**非空逐行清单** `items[]`；每行 `{subtitle_id, cue_version, version, text}`：`cue_version` 为读取时源行版本，`version` 为译文版本（新建传 `0` 或省略，覆盖更新传当前值），`text` 为非空译文文本。
+- **写入前拒绝（`400`，不触碰数据、不占编号）**：清单为空、字段缺失/类型错误、译文文本空白、**同批字幕 ID 重复**、语言代号非法、清单指向**当前字幕集不存在的字幕行**（可能已被重排删除）。
+- **提交时事务内重新核对**：
+  1. `sub_version` / `rules_version` 仍是当前值——漂移 → `409`，带当前规则与字幕；
+  2. 逐行核对源行存在、源行版本 `cue_version` 仍是当前值（过期 → `cue_version_stale`）；
+  3. 逐行核对译文版本：无当前译文却按更新（`version>0`）→ `translation_missing`；已存在译文却按新建（`version=0`）→ `translation_exists`；译文版本不匹配 → `translation_version_stale`。以上过期类 → `409`；
+  4. 译文沿用源行起止，须满足当前 **max_chars / max_cps**——违规 → `invalid`，按 `422` 处理。
+  - **任一行过期或违规，按行返回当前值（`cue`、当前译文 `current`）与中文 `reasons`，整批不写入**（事务回滚）。
+- **通过后同一事务保存全部译文**：
+  - 无当前译文的行 → 新建，译文版本从 **`1`** 开始，状态 `current` 并记录源快照；
+  - 已有当前译文的行（含 **review 待复核**，即允许覆盖）→ 译文**版本 +1**、文本更新、状态转 `current`，**源快照刷新为当前源行**；
+  - **未列出的行不变、其他语言不变**；回填只写译文，**不推进** 字幕集 `sub_version`；写入 `WHERE version=?` 兜底防并发。
+- **批次编号与幂等**：内容指纹（SHA-256，对清单按 `subtitle_id` 排序，故提交顺序不影响；覆盖语言/读取版本/逐行源行版本/译文版本/文本，不含 `batch_no`/`note`）。
+  - **同项目同语言编号重复且内容相同** → `200 {"replayed":true,...}` 原样返回**首次结果**，不再写入任何译文、不增加版本；
+  - **编号相同但内容不同** → `409 {conflict:"batch_no_content_conflict"}`，附首次批次摘要与本次指纹；
+  - 批次编号**按语言独立**（不同语言可复用同一编号）；**失败的核对（400/409/422）不留批次记录、不占编号**，修正后可用同一编号重新提交。
+- **下游读取**：回填后的译文直接出现在 `GET …/translations/:lang` 的并列视图（`current`）、语言总览、按语言导出与多语交付核对中；回填前已生成的原文/译文导出快照**内容不变**。
+
+### API 流程
+
+1. **整批回填** `POST /api/projects/:id/translations/:lang/batches`
+
+   ```json
+   {
+     "batch_no": "B-EN-2026-001",
+     "note": "译者甲交付的第一批英语",
+     "sub_version": 3,
+     "rules_version": 1,
+     "items": [
+       {"subtitle_id": 1, "cue_version": 2, "version": 0, "text": "Hello world"},
+       {"subtitle_id": 2, "cue_version": 1, "version": 1, "text": "Welcome"}
+     ]
+   }
+   ```
+
+   - `201` 首次写入：`{replayed:false, id, batch_no, lang, sub_version, rules_version,
+     item_count, created_count, updated_count, items:[{ord, subtitle_id, action, version, text}]}`，
+     `action` 为 `created`（结果版本 1）/ `updated`（结果版本 = 旧版本 +1）。
+   - `200 {"replayed":true,...}`：同编号同内容重放，其余字段与首次响应逐字一致。
+   - `400`：形状非法（空清单/重复 ID/非法语言/字幕不存在/空文本/非法版本字段，附 `errors`）。
+   - `409`：`sub_version_stale`/`rules_version_stale`（带 `current`）、逐行过期类（`items[].state` 为
+     `cue_missing`/`cue_version_stale`/`translation_missing`/`translation_exists`/`translation_version_stale`，
+     每行附 `cue`、`current` 与 `reasons`），或编号冲突 `batch_no_content_conflict`。
+   - `422`：一行或多行 `state:"invalid"`（超 max_chars/max_cps，附 `reasons`），整批不写入。
+2. **批次清单**：某语言 `GET …/translations/:lang/batches/list`；全部语言 `GET …/translation-batches`（倒序）。
+3. **单个批次** `GET …/translation-batches/:tbid`（不存在 → `404`）：逐行提交值与写入结果（`action`/`result_version`）。
+
+完整 curl 示例：`examples/translation-batches-api.sh`（新建项目排版→整批新建→幂等重放→编号冲突→非法/过期/违规各类拒绝→覆盖待复核整批更新→单语言导出与多语交付读取→批次清单）。
+
 ## 片方多语字幕交付（一个批次冻结原文 + 多语言）
 
 片方交付需要把**原文与若干选定语言冻结在同一时间轴**上。批量交付接口在**一个 SQLite 事务**内完成"再核对 + 整批冻结"，与既有原文/单语言导出共用同一套不可变快照与下载能力：
@@ -259,12 +318,13 @@ Compose 默认把 SQLite 挂到命名卷 `subtitle-data` 持久化（含所有�
 
 ```
 server.js            入口：初始化 SQLite、播种演示数据、启动 HTTP
-src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files）
+src/db.js            连接与建表（projects/words/shots/rules/subtitles/exports/revisions/revision_items/word_revisions/word_revision_items/translations/translation_exports/delivery_batches/delivery_files/translation_batches/translation_batch_items）
 src/layout.js        排版引擎（纯函数）：切点分析 → 分段 → 定时 → 结构自检
 src/validate.js      导入与编辑校验
 src/revision.js      批量字幕修订提议：请求解析 + 整组候选核对（词区间/时间/切点/相邻/规则/版本）
 src/word-revision.js 逐词时间修正：请求解析 + 候选整版核对（词序重叠/锁定边界/受影响区间重排/规则/版本）
 src/translation.js   多语言译文字幕：解析/规则校验/并列视图/失效对账（current→review/history）/导出核对
+src/translation-batch.js 译者整批译文回填：请求解析/内容指纹/事务内逐行版本与规则核对/幂等与批次清单
 src/delivery.js      片方多语交付批次：请求解析 + 事务内整版/逐语言逐行核对 + 批次清单视图
 src/vtt.js           WebVTT 序列化（原文与译文导出共用）
 src/routes.js        Express API
@@ -273,7 +333,8 @@ examples/sample.json 示例转写与切点
 examples/revisions-api.sh 批量字幕修订提议的完整 curl 调用示例
 examples/word-revisions-api.sh 逐词时间修正（提交→预览→确认）的完整 curl 调用示例
 examples/translations-api.sh 多语言译文字幕（保存→查询→失效/复核→确认→按语言导出）的完整 curl 调用示例
+examples/translation-batches-api.sh 译者整批译文回填（整批写入→幂等/冲突→过期/违规→覆盖待复核→下游读取）的完整 curl 调用示例
 examples/deliveries-api.sh 片方多语交付批次（核对→整批冻结→清单查询→既有接口下载）的完整 curl 调用示例
-test/                node:test 单元 + API 集成测试（revision / word-revision / translation / delivery 覆盖四类流程）
+test/                node:test 单元 + API 集成测试（revision / word-revision / translation / translation-batch / delivery 覆盖五类流程）
 Dockerfile / docker-compose.yml
 ```

@@ -194,6 +194,42 @@ CREATE INDEX IF NOT EXISTS idx_delivery_batches_project
   ON delivery_batches(project_id, id);
 CREATE INDEX IF NOT EXISTS idx_delivery_files_project
   ON delivery_files(project_id, batch_id);
+
+-- 译者整批译文回填：译者完成整批译文后，按一种目标语言一次回填到当前字幕。
+-- 批次编号（batch_no）由译者给出，同项目同语言唯一：编号重复且内容相同 → 幂等返回
+-- 首次结果；编号相同内容不同 → 冲突拒绝。仅核对通过并成功写入的批次占编号，
+-- 失败批次不留任何记录（不占编号）。
+CREATE TABLE IF NOT EXISTS translation_batches (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  batch_no       TEXT NOT NULL,               -- 译者批次编号（同项目同语言唯一）
+  lang           TEXT NOT NULL,               -- 目标语言代号（一次回填一种语言）
+  note           TEXT NOT NULL DEFAULT '',    -- 可选说明
+  sub_version    INTEGER NOT NULL,            -- 提交时读取的字幕集版本
+  rules_version  INTEGER NOT NULL,            -- 提交时读取的规则版本
+  item_count     INTEGER NOT NULL,
+  created_count  INTEGER NOT NULL,            -- 新建译文行数
+  updated_count  INTEGER NOT NULL,            -- 覆盖（含待复核）译文行数
+  content_hash   TEXT NOT NULL,               -- 归一化内容指纹（编号重复时判重/冲突）
+  result_json    TEXT NOT NULL,               -- 首次结果快照（编号重复且内容相同时原样返回）
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(project_id, lang, batch_no)
+);
+
+-- 回填批次逐行清单：字幕 ID、提交的源行版本、提交的译文版本（0=新建）与译文文本，
+-- 以及写入结果（created/updated 与写入后的译文版本）。
+CREATE TABLE IF NOT EXISTS translation_batch_items (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id       INTEGER NOT NULL REFERENCES translation_batches(id) ON DELETE CASCADE,
+  ord            INTEGER NOT NULL,            -- 提交清单内顺序
+  subtitle_id    INTEGER NOT NULL,
+  cue_version    INTEGER NOT NULL,            -- 提交时源字幕行版本
+  version        INTEGER NOT NULL,            -- 提交时译文版本（0 表示新建）
+  text           TEXT NOT NULL,               -- 回填译文文本
+  action         TEXT NOT NULL,               -- created（新建，结果版本 1）/ updated（覆盖，版本 +1）
+  result_version INTEGER NOT NULL,            -- 写入后的译文版本
+  UNIQUE(batch_id, ord)
+);
 `;
 
 const DEFAULT_RULES = { max_chars: 30, min_duration_ms: 800, max_cps: 20 };
